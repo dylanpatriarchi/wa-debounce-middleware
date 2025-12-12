@@ -2,6 +2,9 @@ import { Hono } from 'hono';
 import { handle } from 'hono/vercel';
 import axios from 'axios';
 import { sanitizePhoneNumber } from './utils/sanitizer';
+import { verifyWebhook } from './middleware/auth';
+import { logger } from './utils/logger';
+import { redis } from './lib/redis';
 
 const app = new Hono();
 
@@ -9,17 +12,10 @@ const app = new Hono();
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const DEBOUNCE_WINDOW_MS = parseInt(process.env.DEBOUNCE_WINDOW_MS || '2000', 10);
+const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS ? process.env.ALLOWED_NUMBERS.split(',') : null;
+const BLOCKED_NUMBERS = process.env.BLOCKED_NUMBERS ? process.env.BLOCKED_NUMBERS.split(',') : null;
 
-// In-memory storage for debouncing
-// structure: { wa_id: { timer: NodeJS.Timeout, text: string[], name: string, timestamp: number } }
-interface PendingMessage {
-    timer: NodeJS.Timeout;
-    text: string[];
-    name: string;
-    timestamp: number;
-}
-
-const messageBuffer = new Map<string, PendingMessage>();
+app.use('/webhook', verifyWebhook);
 
 app.get('/webhook', (c) => {
     const mode = c.req.query('hub.mode');
@@ -27,62 +23,90 @@ app.get('/webhook', (c) => {
     const challenge = c.req.query('hub.challenge');
 
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-        console.log('Webhook verified successfully!');
+        logger.info('Webhook verified successfully');
         return c.text(challenge || '');
     }
 
+    logger.warn('Webhook verification failed', { mode, token });
     return c.text('Forbidden', 403);
 });
 
 app.post('/webhook', async (c) => {
     try {
         const body = await c.req.json();
-        console.log('Incoming webhook:', JSON.stringify(body, null, 2));
+        logger.info('Incoming webhook', { body });
 
-        // Handle incoming messages
         if (body.object === 'whatsapp_business_account' && body.entry) {
             for (const entry of body.entry) {
                 for (const change of entry.changes) {
                     if (change.value && change.value.messages) {
                         for (const message of change.value.messages) {
-                            const from = message.from; // wa_id
+                            const from = message.from;
                             const name = change.value.contacts?.[0]?.profile?.name || 'Unknown';
                             const timestamp = parseInt(message.timestamp, 10);
+
+                            // Blacklist/Whitelist Check
+                            if (BLOCKED_NUMBERS && BLOCKED_NUMBERS.includes(from)) {
+                                logger.warn('Blocked number attempted to message', { from });
+                                continue;
+                            }
+                            if (ALLOWED_NUMBERS && !ALLOWED_NUMBERS.includes(from)) {
+                                logger.warn('Number not in whitelist', { from });
+                                continue;
+                            }
 
                             if (message.type === 'text') {
                                 const textBody = message.text.body;
 
-                                // Debounce Logic
-                                if (messageBuffer.has(from)) {
-                                    // Existing buffer, clear timer and append text
-                                    const pending = messageBuffer.get(from)!;
-                                    clearTimeout(pending.timer);
-                                    pending.text.push(textBody);
+                                // --- Redis Debounce Logic ---
+                                const redisKey = `wa_buffer:${from}`;
 
-                                    // Restart timer
-                                    pending.timer = setupTimer(from);
+                                // 1. Append text to Redis list
+                                await redis.rpush(redisKey, textBody);
+                                await redis.expire(redisKey, 30); // Safety expiry
 
+                                // 2. Check for active lock
+                                const lockKey = `wa_lock:${from}`;
+                                const isLocked = await redis.set(lockKey, 'locked', { nx: true, ex: DEBOUNCE_WINDOW_MS / 1000 + 1 }); // Lock for slightly more than window
+
+                                if (isLocked) {
+                                    // WE ARE THE LEADER. We wait and then send.
+                                    logger.info('Acquired lock, starting debounce window', { from });
+
+                                    // Simple "Hold" strategy: wait for the window.
+                                    // Verification that we are still the leader is implicit as we set the lock.
+                                    // We simply wait for the window to close.
+                                    await new Promise(resolve => setTimeout(resolve, DEBOUNCE_WINDOW_MS));
+
+                                    // Retrieve all messages
+                                    const messages = await redis.lrange(redisKey, 0, -1);
+                                    if (messages.length > 0) {
+                                        const consolidatedText = messages.join(' ');
+
+                                        await sendToN8N({
+                                            from: sanitizePhoneNumber(from),
+                                            name,
+                                            text: consolidatedText,
+                                            timestamp
+                                        });
+
+                                        // Cleanup
+                                        await redis.del(redisKey);
+                                        await redis.del(lockKey); // Release lock explicitly (though TTL would handle it)
+                                    }
                                 } else {
-                                    // New buffer
-                                    messageBuffer.set(from, {
-                                        timer: setupTimer(from),
-                                        text: [textBody],
-                                        name,
-                                        timestamp
-                                    });
+                                    // FOLLOWER. We just appended the text (step 1).
+                                    // We do nothing else. The LEADER will pick up our message.
+                                    logger.info('Debouncing: Appended message to existing buffer', { from });
                                 }
 
                             } else {
-                                // Non-text message (image, audio, etc.) - Forward immediately
-                                // We forward the raw message or a simplified structure? 
-                                // The prompt says "forward it immediately without debouncing". 
-                                // Let's forward a similar simplified structure but with the type.
-
+                                // Non-text message - Forward immediately
                                 await sendToN8N({
                                     from: sanitizePhoneNumber(from),
                                     name,
                                     message_type: message.type,
-                                    payload: message, // Forward full payload for non-text
+                                    payload: message,
                                     timestamp
                                 });
                             }
@@ -94,42 +118,22 @@ app.post('/webhook', async (c) => {
 
         return c.text('OK');
     } catch (error) {
-        console.error('Error processing webhook:', error);
+        logger.error('Error processing webhook', error);
         return c.text('Internal Server Error', 500);
     }
 });
 
-function setupTimer(wa_id: string) {
-    return setTimeout(async () => {
-        const pending = messageBuffer.get(wa_id);
-        if (!pending) return;
-
-        messageBuffer.delete(wa_id);
-
-        const consolidatedText = pending.text.join(' ');
-        const sanitizedPhone = sanitizePhoneNumber(wa_id);
-
-        await sendToN8N({
-            from: sanitizedPhone,
-            name: pending.name,
-            text: consolidatedText,
-            timestamp: pending.timestamp
-        });
-
-    }, DEBOUNCE_WINDOW_MS);
-}
-
 async function sendToN8N(data: any) {
     if (!N8N_WEBHOOK_URL) {
-        console.error('N8N_WEBHOOK_URL is not defined!');
+        logger.error('N8N_WEBHOOK_URL is not defined!');
         return;
     }
 
     try {
         await axios.post(N8N_WEBHOOK_URL, data);
-        console.log('Forwarded to n8n:', data);
+        logger.info('Forwarded to n8n', { data });
     } catch (error) {
-        console.error('Failed to send to n8n:', error);
+        logger.error('Failed to send to n8n', error);
     }
 }
 

@@ -10,13 +10,14 @@
     "hono": "^4.0.0",
     "google-libphonenumber": "^3.2.33",
     "axios": "^1.6.0",
-    "dotenv": "^16.4.0"
+    "dotenv": "^16.4.0",
+    "@upstash/redis": "^1.28.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/google-libphonenumber": "^7.4.30",
     "typescript": "^5.0.0",
     "vite": "^5.0.0",
-    "@hono/vite-dev-server": "^0.0.0" 
+    "@hono/vite-dev-server": "^0.0.0"
   }
 }
